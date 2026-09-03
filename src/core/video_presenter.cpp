@@ -19,6 +19,7 @@
 #include "video_thread.h"
 #include "video_thread_commands.h"
 
+#include "util/dlss_nr.h"
 #include "util/gpu_device.h"
 #include "util/image.h"
 #include "util/imgui_manager.h"
@@ -58,7 +59,7 @@ static void DrawOverlayBorders(const GSVector2i target_size, const GSVector2i fi
                                const WindowInfoPrerotation prerotation);
 static void DrawDisplay(const GSVector2i target_size, const GSVector2i final_target_size, const GSVector4i source_rect,
                         const GSVector4i display_rect, bool dst_alpha_blend, DisplayRotation rotation,
-                        WindowInfoPrerotation prerotation);
+                        WindowInfoPrerotation prerotation, bool nr_target = false);
 
 static GSVector2i CalculateDisplayPostProcessSourceSize();
 static GPUTexture* GetDisplayPostProcessInputTexture(const GSVector4i source_rect,
@@ -121,6 +122,12 @@ struct Locals
   std::unique_ptr<GPUPipeline> display_24bit_blend_pipeline;
   std::unique_ptr<GPUPipeline> present_copy_blend_pipeline;
 
+  // DLSS 5 Neural Rendering.
+  std::unique_ptr<GPUPipeline> nr_display_pipeline;
+  std::unique_ptr<GPUPipeline> nr_display_24bit_pipeline;
+  std::unique_ptr<GPUPipeline> nr_copy_pipeline;
+  bool nr_enabled = false;
+
   GSVector4i border_overlay_display_rect = GSVector4i::cxpr(0);
 
   // Low-traffic variables down here.
@@ -157,6 +164,9 @@ VideoPresenter::Locals::~Locals()
   DebugAssert(!display_blend_pipeline);
   DebugAssert(!display_24bit_blend_pipeline);
   DebugAssert(!present_copy_blend_pipeline);
+  DebugAssert(!nr_display_pipeline);
+  DebugAssert(!nr_display_24bit_pipeline);
+  DebugAssert(!nr_copy_pipeline);
 }
 
 #endif
@@ -197,6 +207,27 @@ bool VideoPresenter::Initialize(Error* error)
   s_locals.present_format =
     g_gpu_device->HasMainSwapChain() ? g_gpu_device->GetMainSwapChain()->GetFormat() : GPUTextureFormat::RGBA8;
   VERBOSE_LOG("Presentation format is {}", GPUTexture::GetFormatName(s_locals.present_format));
+
+  s_locals.nr_enabled = Core::GetBoolSettingValue("DLSSNR", "Enabled", false);
+  if (s_locals.nr_enabled)
+  {
+    DLSSNRProcessor& nr = DLSSNRProcessor::GetInstance();
+    DLSSNRProcessor::Parameters nr_params;
+    nr_params.style = Core::GetIntSettingValue("DLSSNR", "Style", 1);
+    nr_params.preset = Core::GetIntSettingValue("DLSSNR", "Preset", 3);
+    nr_params.intensity = Core::GetFloatSettingValue("DLSSNR", "Intensity", 1.0f);
+    nr_params.tone = Core::GetFloatSettingValue("DLSSNR", "Tone", 0.0f);
+    nr_params.structure = Core::GetFloatSettingValue("DLSSNR", "Structure", 1.0f);
+    nr_params.skin_structure = Core::GetFloatSettingValue("DLSSNR", "SkinStructure", -1.0f);
+    nr_params.auto_mask = Core::GetBoolSettingValue("DLSSNR", "AutoMask", false);
+    nr.SetParameters(nr_params);
+    nr.SetEnabled(true);
+    Error nr_error;
+    if (nr.Initialize(EmuFolders::DataRoot, &nr_error))
+      INFO_LOG("DLSS 5 Neural Rendering enabled");
+    else
+      WARNING_LOG("DLSS 5 Neural Rendering unavailable: {}", nr_error.GetDescription());
+  }
 
   // overlay has to come first, because it sets the alpha blending on the display pipeline
   if (LoadOverlaySettings())
@@ -246,6 +277,12 @@ void VideoPresenter::Shutdown()
   s_locals.display_blend_pipeline.reset();
   s_locals.display_24bit_blend_pipeline.reset();
   s_locals.present_copy_blend_pipeline.reset();
+
+  s_locals.nr_display_pipeline.reset();
+  s_locals.nr_display_24bit_pipeline.reset();
+  s_locals.nr_copy_pipeline.reset();
+  s_locals.nr_enabled = false;
+  DLSSNRProcessor::GetInstance().Shutdown();
 
   s_locals.border_overlay_display_rect = GSVector4i::zero();
 
@@ -439,6 +476,41 @@ bool VideoPresenter::CompileDisplayPipelines(bool display, bool deinterlace, boo
       s_locals.display_24bit_blend_pipeline.reset();
       s_locals.present_copy_blend_pipeline.reset();
     }
+
+    if (s_locals.nr_enabled && DLSSNRProcessor::GetInstance().IsAvailable())
+    {
+      plconfig.fragment_shader = fso.get();
+      plconfig.blend = GPUPipeline::BlendState::GetNoBlendingState();
+      plconfig.primitive = GPUPipeline::Primitive::TriangleStrips;
+      plconfig.SetTargetFormats(GPUTextureFormat::RGBA16F);
+      if (!(s_locals.nr_display_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
+        return false;
+      GL_OBJECT_NAME(s_locals.nr_display_pipeline, "DLSSNR Display Pipeline");
+
+      if (fso_24bit)
+      {
+        plconfig.fragment_shader = fso_24bit.get();
+        if (!(s_locals.nr_display_24bit_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
+          return false;
+        GL_OBJECT_NAME(s_locals.nr_display_24bit_pipeline, "DLSSNR Display Pipeline 24bit");
+      }
+
+      const std::unique_ptr<GPUShader> nr_copy_fso = g_gpu_device->CreateShader(
+        GPUShaderStage::Fragment, shadergen.GetLanguage(), shadergen.GenerateCopyFragmentShader(false), error);
+      if (!nr_copy_fso)
+        return false;
+      GL_OBJECT_NAME(nr_copy_fso, "DLSSNR Copy Fragment Shader");
+      plconfig.fragment_shader = nr_copy_fso.get();
+      if (!(s_locals.nr_copy_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
+        return false;
+      GL_OBJECT_NAME(s_locals.nr_copy_pipeline, "DLSSNR Copy Pipeline");
+    }
+    else
+    {
+      s_locals.nr_display_pipeline.reset();
+      s_locals.nr_display_24bit_pipeline.reset();
+      s_locals.nr_copy_pipeline.reset();
+    }
   }
 
   plconfig.input_layout = {};
@@ -558,6 +630,8 @@ bool VideoPresenter::CompileDisplayPipelines(bool display, bool deinterlace, boo
 void VideoPresenter::ClearDisplay()
 {
   ClearDisplayTexture();
+
+  DLSSNRProcessor::GetInstance().RequestHistoryReset();
 
   // Just recycle the textures, it'll get re-fetched.
   DestroyDeinterlaceTextures();
@@ -728,6 +802,107 @@ GPUPresentResult VideoPresenter::RenderDisplay(GPUTexture* target, const GSVecto
     return GPUPresentResult::OK;
   };
 
+  // DLSS 5 Neural Rendering: draw the scaled game image into an intermediate texture, run NR on it,
+  // then blit the result to the final target. OSD/UI is drawn later, directly to the swap chain, and
+  // is therefore never passed through NR.
+  const bool nr_available =
+    (s_locals.nr_enabled && DLSSNRProcessor::GetInstance().IsAvailable() && s_locals.nr_display_pipeline &&
+     target == nullptr && !is_vram_view && HasDisplayTexture() && !postfx_delayed_rotation);
+  if (nr_available)
+  {
+    DLSSNRProcessor& nr = DLSSNRProcessor::GetInstance();
+    Error nr_error;
+    const GSVector2i nr_size = draw_rect_without_overlay.rsize();
+    if (nr_size.x > 0 && nr_size.y > 0 && nr.Resize(static_cast<u32>(nr_size.x), static_cast<u32>(nr_size.y), &nr_error))
+    {
+      GPUTexture* const nr_input = nr.GetInputTexture();
+      GPUTexture* nr_output = nr.GetOutputTexture();
+      const GSVector2i nr_input_size = nr_input->GetSizeVec();
+
+      if (postfx_active)
+      {
+        // PostFX runs first, and its result is converted into the NR input.
+        GPUTexture* const postfx_input =
+          GetDisplayPostProcessInputTexture(source_rect, draw_rect_without_overlay, g_gpu_settings.display_rotation);
+        postfx_input->MakeReadyForSampling();
+
+        GPUTexture* const postfx_output = s_locals.display_postfx->GetTextureUnusedAtEndOfChain();
+        ApplyDisplayPostProcess(postfx_output, postfx_input, display_rect_without_overlay,
+                                postfx_output->GetSizeVec());
+        postfx_output->MakeReadyForSampling();
+
+        g_gpu_device->ClearRenderTarget(nr_input, GPUDevice::DEFAULT_CLEAR_COLOR);
+        g_gpu_device->SetRenderTarget(nr_input);
+        g_gpu_device->SetViewportAndScissor(GSVector4i::loadh(nr_input_size));
+        g_gpu_device->SetPipeline(s_locals.nr_copy_pipeline.get());
+        g_gpu_device->SetTextureSampler(0, postfx_output, g_gpu_device->GetNearestSampler());
+        const GSVector4 copy_uv = g_gpu_device->UsesLowerLeftOrigin() ? GSVector4::cxpr(0.0f, 1.0f, 1.0f, 0.0f) :
+                                                                        GSVector4::cxpr(0.0f, 0.0f, 1.0f, 1.0f);
+        DrawScreenQuad(GSVector4i::loadh(nr_input_size), copy_uv, nr_input_size, nr_input_size, DisplayRotation::Normal,
+                       WindowInfoPrerotation::Identity, nullptr, 0);
+      }
+      else
+      {
+        // Draw the scaled display directly into the NR input with the RGBA16F pipeline.
+        g_gpu_device->ClearRenderTarget(nr_input, GPUDevice::DEFAULT_CLEAR_COLOR);
+        g_gpu_device->SetRenderTarget(nr_input);
+        g_gpu_device->SetViewport(GSVector4i::loadh(nr_input_size));
+        DrawDisplay(nr_input_size, nr_input_size, source_rect, GSVector4i::loadh(nr_input_size), false,
+                    g_gpu_settings.display_rotation, WindowInfoPrerotation::Identity, true);
+      }
+
+      // Run neural rendering. On failure, fall back to the un-NR'd image.
+      GPUTexture* present_source = nr_input;
+      if (nr_output && nr.Process(nr_input, nr_output, nr.ConsumeHistoryReset(), &nr_error))
+      {
+        present_source = nr_output;
+      }
+      else
+      {
+        ERROR_LOG("DLSS NR processing failed: {}",
+                  nr_output ? nr_error.GetDescription() : "output texture is unavailable");
+        nr.DisableForSession();
+        s_locals.nr_enabled = false;
+      }
+
+      if (const GPUPresentResult pres = bind_final_target(true); pres != GPUPresentResult::OK)
+        return pres;
+
+      const GSVector4 src_uv_rect = g_gpu_device->UsesLowerLeftOrigin() ? GSVector4::cxpr(0.0f, 1.0f, 1.0f, 0.0f) :
+                                                                          GSVector4::cxpr(0.0f, 0.0f, 1.0f, 1.0f);
+      if (have_overlay)
+      {
+        GL_SCOPE_FMT("Draw overlay and DLSS NR buffer");
+        g_gpu_device->SetPipeline(s_locals.border_overlay_pipeline.get());
+        g_gpu_device->SetTextureSampler(0, s_locals.border_overlay_texture.get(), g_gpu_device->GetLinearSampler());
+        DrawScreenQuad(overlay_rect, GSVector4::cxpr(0.0f, 0.0f, 1.0f, 1.0f), target_size, final_target_size,
+                       DisplayRotation::Normal, prerotation, nullptr, 0);
+
+        if (!overlay_display_rect.eq(draw_rect))
+          DrawOverlayBorders(target_size, final_target_size, overlay_display_rect, draw_rect, prerotation);
+
+        g_gpu_device->SetPipeline(s_locals.present_copy_blend_pipeline.get());
+        g_gpu_device->SetTextureSampler(0, present_source, g_gpu_device->GetNearestSampler());
+        DrawScreenQuad(overlay_display_rect, src_uv_rect, target_size, final_target_size, DisplayRotation::Normal,
+                       prerotation, nullptr, 0);
+      }
+      else
+      {
+        GL_SCOPE_FMT("Draw DLSS NR buffer");
+        g_gpu_device->SetPipeline(FullscreenUI::GetPresentCopyPipeline());
+        g_gpu_device->SetTextureSampler(0, present_source, g_gpu_device->GetNearestSampler());
+        DrawScreenQuad(draw_rect, src_uv_rect, target_size, final_target_size, DisplayRotation::Normal, prerotation,
+                       nullptr, 0);
+      }
+
+      return GPUPresentResult::OK;
+    }
+
+    WARNING_LOG("DLSS NR unavailable this frame: {}", nr_error.GetDescription());
+    nr.DisableForSession();
+    s_locals.nr_enabled = false;
+  }
+
   // If postfx is enabled, we need to draw to an intermediate buffer first.
   if (postfx_active)
   {
@@ -897,7 +1072,7 @@ void VideoPresenter::DrawOverlayBorders(const GSVector2i target_size, const GSVe
 
 void VideoPresenter::DrawDisplay(const GSVector2i target_size, const GSVector2i final_target_size,
                                  const GSVector4i source_rect, const GSVector4i display_rect, bool dst_alpha_blend,
-                                 DisplayRotation rotation, WindowInfoPrerotation prerotation)
+                                 DisplayRotation rotation, WindowInfoPrerotation prerotation, bool nr_target)
 {
   bool texture_filter_linear = false;
 
@@ -947,12 +1122,29 @@ void VideoPresenter::DrawDisplay(const GSVector2i target_size, const GSVector2i 
       break;
   }
 
-  if (s_locals.display_texture_24bit && s_locals.display_24bit_pipeline)
+  if (nr_target)
+  {
+    GPUPipeline* const nr_pipeline = (s_locals.display_texture_24bit && s_locals.nr_display_24bit_pipeline) ?
+                                       s_locals.nr_display_24bit_pipeline.get() :
+                                       s_locals.nr_display_pipeline.get();
+    if (!nr_pipeline)
+    {
+      ERROR_LOG("DLSS NR display pipeline is not compiled");
+      return;
+    }
+
+    g_gpu_device->SetPipeline(nr_pipeline);
+  }
+  else if (s_locals.display_texture_24bit && s_locals.display_24bit_pipeline)
+  {
     g_gpu_device->SetPipeline(dst_alpha_blend ? s_locals.display_24bit_blend_pipeline.get() :
                                                 s_locals.display_24bit_pipeline.get());
+  }
   else
+  {
     g_gpu_device->SetPipeline(dst_alpha_blend ? s_locals.display_blend_pipeline.get() :
                                                 s_locals.display_pipeline.get());
+  }
   g_gpu_device->SetTextureSampler(0, s_locals.display_texture,
                                   texture_filter_linear ? g_gpu_device->GetLinearSampler() :
                                                           g_gpu_device->GetNearestSampler());

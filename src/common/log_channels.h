@@ -18,6 +18,7 @@
   X(CueParser)                                                                                                         \
   X(DiscordPresence)                                                                                                   \
   X(DInputSource)                                                                                                      \
+  X(DLSSNR)                                                                                                            \
   X(DMA)                                                                                                               \
   X(DynamicLibrary)                                                                                                    \
   X(FileLoader)                                                                                                        \

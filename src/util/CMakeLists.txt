@@ -28,6 +28,8 @@ add_library(util
   core_audio_stream.h
   cue_parser.cpp
   cue_parser.h
+  dlss_nr.cpp
+  dlss_nr.h
   dyn_shaderc.h
   dyn_spirv_cross.h
   dyn_sqlite.h

@@ -30,6 +30,7 @@
     <ClInclude Include="d3d12_texture.h" />
     <ClInclude Include="d3d_common.h" />
     <ClInclude Include="dinput_source.h" />
+    <ClInclude Include="dlss_nr.h" />
     <ClInclude Include="gpu_device.h" />
     <ClInclude Include="gpu_framebuffer_manager.h" />
     <ClInclude Include="gpu_shader_cache.h" />
@@ -150,6 +151,7 @@
     <ClCompile Include="d3d12_texture.cpp" />
     <ClCompile Include="d3d_common.cpp" />
     <ClCompile Include="dinput_source.cpp" />
+    <ClCompile Include="dlss_nr.cpp" />
     <ClCompile Include="elf_file.cpp" />
     <ClCompile Include="gpu_device.cpp" />
     <ClCompile Include="gpu_shader_cache.cpp" />
