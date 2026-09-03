@@ -228,7 +228,7 @@ bool VideoPresenter::Initialize(Error* error)
     nr_params.structure = Core::GetFloatSettingValue("DLSSNR", "Structure", 1.0f);
     nr_params.skin_structure = Core::GetFloatSettingValue("DLSSNR", "SkinStructure", -1.0f);
     nr_params.auto_mask = Core::GetBoolSettingValue("DLSSNR", "AutoMask", false);
-    nr_params.pgxp_depth = Core::GetBoolSettingValue("DLSSNR", "PGXPDepth", false);
+    nr_params.pgxp_depth = Core::GetBoolSettingValue("DLSSNR", "PGXPDepth", true);
     s_locals.nr_depth_enabled = nr_params.pgxp_depth;
     nr.SetParameters(nr_params);
     nr.SetEnabled(true);
