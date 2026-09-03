@@ -102,6 +102,8 @@ struct Locals
   std::unique_ptr<GPUPipeline> display_24bit_pipeline;
   GPUTexture* display_texture = nullptr;
   GSVector4i display_texture_rect = GSVector4i::cxpr(0);
+  GPUTexture* display_depth_texture = nullptr;
+  GSVector4i display_depth_texture_rect = GSVector4i::cxpr(0);
 
   u64 last_present_time = 0;
   u64 next_throttle_time = 0;
@@ -126,7 +128,10 @@ struct Locals
   std::unique_ptr<GPUPipeline> nr_display_pipeline;
   std::unique_ptr<GPUPipeline> nr_display_24bit_pipeline;
   std::unique_ptr<GPUPipeline> nr_copy_pipeline;
+  std::unique_ptr<GPUPipeline> nr_depth_copy_pipeline;
   bool nr_enabled = false;
+  bool nr_depth_enabled = false;
+  bool nr_depth_bound = false;
 
   GSVector4i border_overlay_display_rect = GSVector4i::cxpr(0);
 
@@ -157,6 +162,7 @@ VideoPresenter::Locals::~Locals()
   DebugAssert(!display_pipeline);
   DebugAssert(!display_24bit_pipeline);
   DebugAssert(!display_texture);
+  DebugAssert(!display_depth_texture);
   DebugAssert(!display_postfx);
   DebugAssert(!border_overlay_texture);
   DebugAssert(!border_overlay_pipeline);
@@ -167,6 +173,7 @@ VideoPresenter::Locals::~Locals()
   DebugAssert(!nr_display_pipeline);
   DebugAssert(!nr_display_24bit_pipeline);
   DebugAssert(!nr_copy_pipeline);
+  DebugAssert(!nr_depth_copy_pipeline);
 }
 
 #endif
@@ -209,6 +216,7 @@ bool VideoPresenter::Initialize(Error* error)
   VERBOSE_LOG("Presentation format is {}", GPUTexture::GetFormatName(s_locals.present_format));
 
   s_locals.nr_enabled = Core::GetBoolSettingValue("DLSSNR", "Enabled", false);
+  s_locals.nr_depth_enabled = false;
   if (s_locals.nr_enabled)
   {
     DLSSNRProcessor& nr = DLSSNRProcessor::GetInstance();
@@ -220,6 +228,8 @@ bool VideoPresenter::Initialize(Error* error)
     nr_params.structure = Core::GetFloatSettingValue("DLSSNR", "Structure", 1.0f);
     nr_params.skin_structure = Core::GetFloatSettingValue("DLSSNR", "SkinStructure", -1.0f);
     nr_params.auto_mask = Core::GetBoolSettingValue("DLSSNR", "AutoMask", false);
+    nr_params.pgxp_depth = Core::GetBoolSettingValue("DLSSNR", "PGXPDepth", false);
+    s_locals.nr_depth_enabled = nr_params.pgxp_depth;
     nr.SetParameters(nr_params);
     nr.SetEnabled(true);
     Error nr_error;
@@ -264,6 +274,8 @@ void VideoPresenter::Shutdown()
   s_locals.display_24bit_pipeline.reset();
   s_locals.display_texture = nullptr;
   s_locals.display_texture_rect = GSVector4i::zero();
+  s_locals.display_depth_texture = nullptr;
+  s_locals.display_depth_texture_rect = GSVector4i::zero();
 
   s_locals.present_format = GPUTextureFormat::Unknown;
   s_locals.display_texture_24bit = false;
@@ -281,7 +293,10 @@ void VideoPresenter::Shutdown()
   s_locals.nr_display_pipeline.reset();
   s_locals.nr_display_24bit_pipeline.reset();
   s_locals.nr_copy_pipeline.reset();
+  s_locals.nr_depth_copy_pipeline.reset();
   s_locals.nr_enabled = false;
+  s_locals.nr_depth_enabled = false;
+  s_locals.nr_depth_bound = false;
   DLSSNRProcessor::GetInstance().Shutdown();
 
   s_locals.border_overlay_display_rect = GSVector4i::zero();
@@ -504,12 +519,21 @@ bool VideoPresenter::CompileDisplayPipelines(bool display, bool deinterlace, boo
       if (!(s_locals.nr_copy_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
         return false;
       GL_OBJECT_NAME(s_locals.nr_copy_pipeline, "DLSSNR Copy Pipeline");
+
+      if (s_locals.nr_depth_enabled)
+      {
+        plconfig.SetTargetFormats(GPUTextureFormat::R32F);
+        if (!(s_locals.nr_depth_copy_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
+          return false;
+        GL_OBJECT_NAME(s_locals.nr_depth_copy_pipeline, "DLSSNR Depth Copy Pipeline");
+      }
     }
     else
     {
       s_locals.nr_display_pipeline.reset();
       s_locals.nr_display_24bit_pipeline.reset();
       s_locals.nr_copy_pipeline.reset();
+      s_locals.nr_depth_copy_pipeline.reset();
     }
   }
 
@@ -641,7 +665,19 @@ void VideoPresenter::ClearDisplayTexture()
 {
   s_locals.display_texture = nullptr;
   s_locals.display_texture_rect = GSVector4i::zero();
+  ClearDisplayDepthTexture();
   FullscreenUI::InvalidateBlurBackground();
+}
+
+void VideoPresenter::ClearDisplayDepthTexture()
+{
+  s_locals.display_depth_texture = nullptr;
+  s_locals.display_depth_texture_rect = GSVector4i::zero();
+}
+
+bool VideoPresenter::IsDLSSNRDepthEnabled()
+{
+  return s_locals.nr_enabled && s_locals.nr_depth_enabled && DLSSNRProcessor::GetInstance().IsAvailable();
 }
 
 void VideoPresenter::SetDisplayParameters(const GSVector2i& video_size, const GSVector4i& video_active_rect,
@@ -666,6 +702,13 @@ void VideoPresenter::SetDisplayTexture(GPUTexture* texture, const GSVector4i& so
   FullscreenUI::InvalidateBlurBackground();
 }
 
+void VideoPresenter::SetDisplayDepthTexture(GPUTexture* texture, const GSVector4i& source_rect)
+{
+  DebugAssert(texture);
+  s_locals.display_depth_texture = texture;
+  s_locals.display_depth_texture_rect = source_rect;
+}
+
 GPUPresentResult VideoPresenter::RenderDisplay(GPUTexture* target, const GSVector2i target_size,
                                                const GSVector2i final_target_size, WindowInfoPrerotation prerotation,
                                                bool postfx, bool apply_aspect_ratio)
@@ -674,6 +717,8 @@ GPUPresentResult VideoPresenter::RenderDisplay(GPUTexture* target, const GSVecto
 
   if (s_locals.display_texture)
     s_locals.display_texture->MakeReadyForSampling();
+  if (s_locals.display_depth_texture)
+    s_locals.display_depth_texture->MakeReadyForSampling();
 
   DebugAssert(target || g_gpu_device->HasMainSwapChain());
   DebugAssert(!postfx || target_size.eq(g_gpu_device->GetMainSwapChain()->GetSizeVec()));
@@ -818,6 +863,26 @@ GPUPresentResult VideoPresenter::RenderDisplay(GPUTexture* target, const GSVecto
       GPUTexture* const nr_input = nr.GetInputTexture();
       GPUTexture* nr_output = nr.GetOutputTexture();
       const GSVector2i nr_input_size = nr_input->GetSizeVec();
+      GPUTexture* nr_depth = nullptr;
+
+      if (s_locals.nr_depth_enabled && s_locals.display_depth_texture && s_locals.nr_depth_copy_pipeline &&
+          nr.GetDepthTexture() && !s_locals.display_depth_texture_rect.rempty())
+      {
+        nr_depth = nr.GetDepthTexture();
+        g_gpu_device->ClearRenderTarget(nr_depth, GPUDevice::DEFAULT_CLEAR_COLOR);
+        g_gpu_device->SetRenderTarget(nr_depth);
+        g_gpu_device->SetViewportAndScissor(GSVector4i::loadh(nr_input_size));
+        g_gpu_device->SetPipeline(s_locals.nr_depth_copy_pipeline.get());
+        g_gpu_device->SetTextureSampler(0, s_locals.display_depth_texture, g_gpu_device->GetNearestSampler());
+        const GSVector4 depth_uv_rect =
+          GSVector4(s_locals.display_depth_texture_rect) /
+          GSVector4::xyxy(GSVector2(s_locals.display_depth_texture->GetSizeVec()));
+        DrawScreenQuad(GSVector4i::loadh(nr_input_size), depth_uv_rect, nr_input_size, nr_input_size,
+                       g_gpu_settings.display_rotation, WindowInfoPrerotation::Identity, nullptr, 0);
+        nr_depth->MakeReadyForSampling();
+        GL_INS_FMT("DLSS NR PGXP depth: {}x{} -> {}x{}", s_locals.display_depth_texture_rect.width(),
+                   s_locals.display_depth_texture_rect.height(), nr_input_size.x, nr_input_size.y);
+      }
 
       if (postfx_active)
       {
@@ -851,9 +916,17 @@ GPUPresentResult VideoPresenter::RenderDisplay(GPUTexture* target, const GSVecto
                     g_gpu_settings.display_rotation, WindowInfoPrerotation::Identity, true);
       }
 
+      // Reset temporal history when the optional depth input appears or disappears.
+      const bool depth_bound = (nr_depth != nullptr);
+      if (depth_bound != s_locals.nr_depth_bound)
+      {
+        nr.RequestHistoryReset();
+        s_locals.nr_depth_bound = depth_bound;
+      }
+
       // Run neural rendering. On failure, fall back to the un-NR'd image.
       GPUTexture* present_source = nr_input;
-      if (nr_output && nr.Process(nr_input, nr_output, nr.ConsumeHistoryReset(), &nr_error))
+      if (nr_output && nr.Process(nr_input, nr_output, nr_depth, nr.ConsumeHistoryReset(), &nr_error))
       {
         present_source = nr_output;
       }

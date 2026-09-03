@@ -32,6 +32,7 @@ const GSVector2i& GetVideoSize();
 GPUTexture* GetDisplayTexture();
 const GSVector4i& GetDisplayTextureRect();
 bool HasDisplayTexture();
+bool IsDLSSNRDepthEnabled();
 
 bool IsInitialized();
 bool Initialize(Error* error);
@@ -41,9 +42,11 @@ bool UpdateSettings(const GPUSettings& old_settings, Error* error);
 
 void ClearDisplay();
 void ClearDisplayTexture();
+void ClearDisplayDepthTexture();
 void SetDisplayParameters(const GSVector2i& video_size, const GSVector4i& video_active_rect,
                           float display_pixel_aspect_ratio, bool display_24bit);
 void SetDisplayTexture(GPUTexture* texture, const GSVector4i& source_rect);
+void SetDisplayDepthTexture(GPUTexture* texture, const GSVector4i& source_rect);
 bool Deinterlace(u32 field);
 bool ApplyChromaSmoothing();
 

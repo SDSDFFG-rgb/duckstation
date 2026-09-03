@@ -4047,6 +4047,7 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
   GL_SCOPE("UpdateDisplay()");
 
   GPUTextureCache::Compact();
+  VideoPresenter::ClearDisplayDepthTexture();
 
   // If this is a 480i single buffer game, then rendering should complete within one vblank.
   // Therefore we should clear the depth buffer, because the drawing area may not change.
@@ -4079,6 +4080,10 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
   const u32 scaled_display_width = cmd->display_vram_width * resolution_scale;
   const u32 scaled_display_height = cmd->display_vram_height * resolution_scale;
   bool drew_anything = false;
+  const bool use_nr_depth =
+    !cmd->display_24bit && m_pgxp_depth_buffer && VideoPresenter::IsDLSSNRDepthEnabled() &&
+    m_downsample_mode == GPUDownsampleMode::Disabled && !interlaced &&
+    (!m_internal_postfx || !m_internal_postfx->IsActive());
 
   if (cmd->display_disabled)
   {
@@ -4094,7 +4099,7 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
   else if (!cmd->display_24bit && line_skip == 0 && !IsUsingMultisampling() &&
            (scaled_vram_offset_x + scaled_display_width) <= m_vram_texture->GetWidth() &&
            (scaled_vram_offset_y + scaled_display_height) <= m_vram_texture->GetHeight() &&
-           (!m_internal_postfx || !m_internal_postfx->IsActive()))
+           (!m_internal_postfx || !m_internal_postfx->IsActive()) && !use_nr_depth)
   {
     VideoPresenter::SetDisplayTexture(m_vram_texture.get(), GSVector4i(scaled_vram_offset_x, scaled_vram_offset_y,
                                                                        scaled_vram_offset_x + scaled_display_width,
@@ -4125,15 +4130,18 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
     m_vram_texture->MakeReadyForSampling();
     g_gpu_device->InvalidateRenderTarget(m_vram_extract_texture.get());
 
-    // Don't bother grabbing depth if postfx doesn't need it.
+    // Don't bother grabbing depth if postfx or the experimental DLSS NR path doesn't need it.
+    const bool need_depth =
+      !cmd->display_24bit && m_pgxp_depth_buffer &&
+      (use_nr_depth || (m_internal_postfx && m_internal_postfx->NeedsDepthBuffer()));
     GPUTexture* depth_source =
-      (!cmd->display_24bit && m_pgxp_depth_buffer && m_internal_postfx && m_internal_postfx->NeedsDepthBuffer()) ?
-        (m_depth_was_copied ? m_vram_depth_copy_texture.get() : m_vram_depth_texture.get()) :
-        nullptr;
+      need_depth ? (m_depth_was_copied ? m_vram_depth_copy_texture.get() : m_vram_depth_texture.get()) : nullptr;
+    bool nr_depth_extracted = false;
     if (depth_source &&
         g_gpu_device->ResizeTexture(&m_vram_extract_depth_texture, scaled_display_width, scaled_display_height,
                                     GPUTexture::Type::RenderTarget, VRAM_DS_COLOR_FORMAT, GPUTexture::Flags::None))
     {
+      nr_depth_extracted = use_nr_depth;
       depth_source->MakeReadyForSampling();
       g_gpu_device->InvalidateRenderTarget(m_vram_extract_depth_texture.get());
 
@@ -4212,6 +4220,12 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
     {
       if (interlaced)
         VideoPresenter::Deinterlace(interlaced_field);
+    }
+
+    if (use_nr_depth && nr_depth_extracted && VideoPresenter::HasDisplayTexture())
+    {
+      VideoPresenter::SetDisplayDepthTexture(m_vram_extract_depth_texture.get(),
+                                             VideoPresenter::GetDisplayTextureRect());
     }
   }
 

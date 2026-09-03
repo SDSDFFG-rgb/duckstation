@@ -6,6 +6,7 @@
 #include "common/types.h"
 #include "util/gpu_texture.h"
 
+#include <memory>
 #include <string>
 
 class Error;
@@ -30,6 +31,7 @@ public:
     float structure = 1.0f;
     float skin_structure = -1.0f;
     bool auto_mask = false;
+    bool pgxp_depth = false;
   };
 
   static DLSSNRProcessor& GetInstance();
@@ -61,11 +63,13 @@ public:
 
   ALWAYS_INLINE GPUTexture* GetInputTexture() const { return m_input_texture.get(); }
   ALWAYS_INLINE GPUTexture* GetOutputTexture() const { return m_output_texture.get(); }
+  ALWAYS_INLINE GPUTexture* GetDepthTexture() const { return m_depth_texture.get(); }
 
   /// Records the neural rendering evaluation into the current D3D12 command list.
-  /// Both textures must be RGBA16F and sized to the last Resize() call. Submits the
-  /// command list afterwards to invalidate cached device state.
-  bool Process(GPUTexture* input, GPUTexture* output, bool reset_history, Error* error);
+  /// The color textures must be RGBA16F, the optional depth texture must be R32F,
+  /// and all textures must be sized to the last Resize() call. Submits the command
+  /// list afterwards to invalidate cached device state.
+  bool Process(GPUTexture* input, GPUTexture* output, GPUTexture* depth, bool reset_history, Error* error);
 
   /// Returns true if a temporal history reset is pending, and clears the pending flag.
   bool ConsumeHistoryReset();
@@ -99,6 +103,7 @@ private:
 
   std::unique_ptr<GPUTexture> m_input_texture;
   std::unique_ptr<GPUTexture> m_output_texture;
+  std::unique_ptr<GPUTexture> m_depth_texture;
 
   // Opaque NGX objects and module/function pointers, only used on Windows.
   void* m_device = nullptr;

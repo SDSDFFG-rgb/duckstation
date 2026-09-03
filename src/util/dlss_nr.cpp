@@ -139,7 +139,7 @@ void DLSSNRProcessor::SetParameters(const Parameters& params)
   if (params.style != m_user_params.style || params.preset != m_user_params.preset ||
       params.intensity != m_user_params.intensity || params.tone != m_user_params.tone ||
       params.structure != m_user_params.structure || params.skin_structure != m_user_params.skin_structure ||
-      params.auto_mask != m_user_params.auto_mask)
+      params.auto_mask != m_user_params.auto_mask || params.pgxp_depth != m_user_params.pgxp_depth)
   {
     m_params_dirty = true;
   }
@@ -492,6 +492,18 @@ bool DLSSNRProcessor::Resize(u32 width, u32 height, Error* error)
     return false;
   }
 
+  if (m_user_params.pgxp_depth)
+  {
+    m_depth_texture = g_gpu_device->CreateTexture(width, height, 1, 1, 1, GPUTexture::Type::RenderTarget,
+                                                  GPUTextureFormat::R32F, GPUTexture::Flags::None, nullptr, 0, error);
+    if (!m_depth_texture)
+    {
+      Error::AddPrefix(error, "Failed to create DLSS NR depth texture: ");
+      DestroyTextures();
+      return false;
+    }
+  }
+
   if (!CreateFeature(error))
   {
     DestroyTextures();
@@ -520,9 +532,10 @@ bool DLSSNRProcessor::CreateFeature(Error* error)
   const u32 width = in->GetWidth();
   const u32 height = in->GetHeight();
 
-  INFO_LOG("creating feature {} (style={} preset={} intensity={:.1f} tone={:.1f} structure={:.1f} skin={:.1f})",
+  INFO_LOG("creating feature {} (style={} preset={} intensity={:.1f} tone={:.1f} structure={:.1f} skin={:.1f} "
+           "pgxp_depth={})",
            DLSS_NR_FEATURE_ID, m_user_params.style, m_user_params.preset, m_user_params.intensity,
-           m_user_params.tone, m_user_params.structure, m_user_params.skin_structure);
+           m_user_params.tone, m_user_params.structure, m_user_params.skin_structure, m_user_params.pgxp_depth);
   params->Set("DLSSNR.Width", width);
   params->Set("DLSSNR.Height", height);
   params->Set("DLSSNR.Enabled", 1);
@@ -535,17 +548,22 @@ bool DLSSNRProcessor::CreateFeature(Error* error)
   params->Set("DLSSNR.SkinStructureStrength", m_user_params.skin_structure);
   params->Set("DLSSNR.UseAutoMask", m_user_params.auto_mask ? 1 : 0);
   params->Set("DLSSNR.UICorrection", 0);
-  params->Set("DLSSNR.DepthInverted", 1);
+  params->Set("DLSSNR.DepthInverted", m_user_params.pgxp_depth ? 1 : 0);
   params->Set("DLSSNR.ScalingRatio", 1.0f);
   params->Set("DLSSNR.MVecScaleX", 1.0f);
   params->Set("DLSSNR.MVecScaleY", 1.0f);
   params->Set("DLSSNR.Color", in->GetResource());
   params->Set("DLSSNR.Output", out->GetResource());
   params->Set("DLSSNR.Backbuffer", out->GetResource());
+  params->Set("DLSSNR.Depth", m_depth_texture ? m_depth_texture->GetResource() : static_cast<ID3D12Resource*>(nullptr));
   params->Set("DLSSNR.ColorSubrectBaseX", 0);
   params->Set("DLSSNR.ColorSubrectBaseY", 0);
   params->Set("DLSSNR.ColorSubrectWidth", width);
   params->Set("DLSSNR.ColorSubrectHeight", height);
+  params->Set("DLSSNR.DepthSubrectBaseX", 0);
+  params->Set("DLSSNR.DepthSubrectBaseY", 0);
+  params->Set("DLSSNR.DepthSubrectWidth", m_depth_texture ? width : 0u);
+  params->Set("DLSSNR.DepthSubrectHeight", m_depth_texture ? height : 0u);
   params->Set("DLSSNR.OutputSubrectBaseX", 0);
   params->Set("DLSSNR.OutputSubrectBaseY", 0);
   params->Set("DLSSNR.OutputSubrectWidth", width);
@@ -602,14 +620,16 @@ void DLSSNRProcessor::DestroyTextures()
   {
     g_gpu_device->RecycleTexture(std::move(m_input_texture));
     g_gpu_device->RecycleTexture(std::move(m_output_texture));
+    g_gpu_device->RecycleTexture(std::move(m_depth_texture));
   }
   m_input_texture.reset();
   m_output_texture.reset();
+  m_depth_texture.reset();
   m_width = 0;
   m_height = 0;
 }
 
-bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, bool reset_history, Error* error)
+bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, GPUTexture* depth, bool reset_history, Error* error)
 {
   if (!m_params || !m_feature)
   {
@@ -623,13 +643,22 @@ bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, bool reset_
 
   auto* const in = static_cast<D3D12Texture*>(input);
   auto* const out = static_cast<D3D12Texture*>(output);
+  auto* const depth12 = depth ? static_cast<D3D12Texture*>(depth) : nullptr;
   ID3D12GraphicsCommandList4* const cmd = dev.GetCommandList();
   NVSDK_NGX_Parameter* const params = static_cast<NVSDK_NGX_Parameter*>(m_params);
   auto* const handle = static_cast<NVSDK_NGX_Handle*>(m_feature);
 
   in->TransitionToState(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   out->TransitionToState(cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (depth12)
+    depth12->TransitionToState(cmd, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   params->Set("DLSSNR.Reset", reset_history ? 1 : 0);
+  params->Set("DLSSNR.DepthInverted", depth12 ? 1 : 0);
+  params->Set("DLSSNR.Depth", depth12 ? depth12->GetResource() : static_cast<ID3D12Resource*>(nullptr));
+  params->Set("DLSSNR.DepthSubrectBaseX", 0);
+  params->Set("DLSSNR.DepthSubrectBaseY", 0);
+  params->Set("DLSSNR.DepthSubrectWidth", depth12 ? depth12->GetWidth() : 0u);
+  params->Set("DLSSNR.DepthSubrectHeight", depth12 ? depth12->GetHeight() : 0u);
 
   if (reset_history)
   {
@@ -650,6 +679,8 @@ bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, bool reset_
     ERROR_LOG("EvaluateFeature failed: 0x{:08X}", static_cast<unsigned>(r));
     Error::SetStringFmt(error, "NVSDK_NGX_D3D12_EvaluateFeature() failed: 0x{:08X}", static_cast<unsigned>(r));
     out->TransitionToState(cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (depth12)
+      depth12->TransitionToState(cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     dev.SubmitCommandList(false);
     return false;
   }
@@ -662,6 +693,8 @@ bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, bool reset_
                                               {}};
   cmd->ResourceBarrier(1, &uav_barrier);
   out->TransitionToState(cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (depth12)
+    depth12->TransitionToState(cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
   dev.SubmitCommandList(false);
   return true;
 }
@@ -728,7 +761,7 @@ bool DLSSNRProcessor::Resize(u32 width, u32 height, Error* error)
   return false;
 }
 
-bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, bool reset_history, Error* error)
+bool DLSSNRProcessor::Process(GPUTexture* input, GPUTexture* output, GPUTexture* depth, bool reset_history, Error* error)
 {
   Error::SetStringView(error, "DLSS NR is only supported on Windows.");
   return false;
