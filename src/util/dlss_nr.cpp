@@ -529,6 +529,7 @@ bool DLSSNRProcessor::CreateFeature(Error* error)
   NVSDK_NGX_Parameter* const params = static_cast<NVSDK_NGX_Parameter*>(m_params);
   auto* const in = static_cast<D3D12Texture*>(m_input_texture.get());
   auto* const out = static_cast<D3D12Texture*>(m_output_texture.get());
+  auto* const depth = m_depth_texture ? static_cast<D3D12Texture*>(m_depth_texture.get()) : nullptr;
   const u32 width = in->GetWidth();
   const u32 height = in->GetHeight();
 
@@ -555,15 +556,15 @@ bool DLSSNRProcessor::CreateFeature(Error* error)
   params->Set("DLSSNR.Color", in->GetResource());
   params->Set("DLSSNR.Output", out->GetResource());
   params->Set("DLSSNR.Backbuffer", out->GetResource());
-  params->Set("DLSSNR.Depth", m_depth_texture ? m_depth_texture->GetResource() : static_cast<ID3D12Resource*>(nullptr));
+  params->Set("DLSSNR.Depth", depth ? depth->GetResource() : static_cast<ID3D12Resource*>(nullptr));
   params->Set("DLSSNR.ColorSubrectBaseX", 0);
   params->Set("DLSSNR.ColorSubrectBaseY", 0);
   params->Set("DLSSNR.ColorSubrectWidth", width);
   params->Set("DLSSNR.ColorSubrectHeight", height);
   params->Set("DLSSNR.DepthSubrectBaseX", 0);
   params->Set("DLSSNR.DepthSubrectBaseY", 0);
-  params->Set("DLSSNR.DepthSubrectWidth", m_depth_texture ? width : 0u);
-  params->Set("DLSSNR.DepthSubrectHeight", m_depth_texture ? height : 0u);
+  params->Set("DLSSNR.DepthSubrectWidth", depth ? width : 0u);
+  params->Set("DLSSNR.DepthSubrectHeight", depth ? height : 0u);
   params->Set("DLSSNR.OutputSubrectBaseX", 0);
   params->Set("DLSSNR.OutputSubrectBaseY", 0);
   params->Set("DLSSNR.OutputSubrectWidth", width);
